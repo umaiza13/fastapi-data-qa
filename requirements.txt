@@ -6,3 +6,4 @@ matplotlib
 duckdb
 beautifulsoup4
 requests
+networkx
