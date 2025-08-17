@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+openai>=1.0.0
+pandas
+matplotlib
+duckdb
+beautifulsoup4
+requests
