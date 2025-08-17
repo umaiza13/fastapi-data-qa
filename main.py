@@ -7,7 +7,7 @@ import asyncio
 import re
 import requests
 import pandas as pd
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request,Body
 from fastapi.responses import JSONResponse
 from typing import List, Optional
 from openai import OpenAI
@@ -301,3 +301,37 @@ async def process_task(
             return JSONResponse(content=results)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+    from fastapi import Body
+
+@app.post("/")
+async def analyze_json(payload: dict = Body(...)):
+    """
+    This endpoint is for the submission portal.
+    It expects JSON with keys 'csv' (string) and 'question'.
+    Example:
+    {
+      "csv": "region,sales,day\nWest,100,1\nEast,200,2",
+      "question": "Analyze sales data"
+    }
+    """
+    csv_data = payload.get("csv")
+    question = payload.get("question", "")
+
+    if not csv_data:
+        raise HTTPException(status_code=400, detail="Missing 'csv' in request")
+
+    try:
+        # Turn CSV string into a DataFrame
+        df = pd.read_csv(io.StringIO(csv_data))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid CSV format: {e}")
+
+    # Create an empty results dictionary
+    parsed_json = {}
+
+    # Reuse your existing auto analysis function
+    parsed_json = auto_stats_and_charts(csv_data.encode(), parsed_json, question)
+
+    # Return the results
+    return JSONResponse(content=parsed_json)
+    
