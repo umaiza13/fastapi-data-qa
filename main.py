@@ -159,11 +159,24 @@ def auto_stats_and_charts(csv_bytes, parsed_json, question):
         parsed_json[f"{numeric_cols[0]}_{numeric_cols[1]}_scatterplot"] = base64.b64encode(buf.getvalue()).decode()
 
     return parsed_json
+
 import networkx as nx
 
 def is_edge_list_csv(df):
-    cols = [c.lower() for c in df.columns]
-    return ("source" in cols and "target" in cols) or ("from" in cols and "to" in cols)
+    """
+    Generalized detection of edge list CSVs.
+    Returns True if the CSV looks like a graph edge list.
+    """
+    if df.shape[1] < 2:
+        return False
+    sample = df.iloc[:20, :2]
+    non_empty_ratio = sample.notna().mean().min()
+    if non_empty_ratio < 0.8:
+        return False
+    unique_ratio = (sample.nunique() / len(sample)).mean()
+    if unique_ratio > 0.9:
+        return False
+    return True
 
 def network_stats_and_charts(csv_bytes, parsed_json, question):
     import pandas as pd
@@ -172,7 +185,6 @@ def network_stats_and_charts(csv_bytes, parsed_json, question):
     import io, base64
     df = pd.read_csv(BytesIO(csv_bytes))
     G = nx.Graph()
-    # Use first two columns as edges
     col1, col2 = df.columns[:2]
     for _, row in df.iterrows():
         G.add_edge(row[col1], row[col2])
@@ -188,16 +200,14 @@ def network_stats_and_charts(csv_bytes, parsed_json, question):
     except Exception:
         parsed_json['shortest_path_alice_eve'] = None
 
-    # Draw network graph
     plt.figure(figsize=(4,4))
     pos = nx.spring_layout(G)
     nx.draw(G, pos, with_labels=True, node_color='lightblue', edge_color='gray', font_size=10)
     buf = io.BytesIO()
     plt.savefig(buf, format="png")
     plt.close()
-    parsed_json['network_graph'] = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    parsed_json['network_graph'] = base64.b64encode(buf.getvalue()).decode()
 
-    # Degree histogram
     plt.figure(figsize=(4,3))
     degree_values = list(degrees.values())
     plt.bar(range(len(degree_values)), degree_values, color='green')
@@ -209,7 +219,7 @@ def network_stats_and_charts(csv_bytes, parsed_json, question):
     buf = io.BytesIO()
     plt.savefig(buf, format="png")
     plt.close()
-    parsed_json['degree_histogram'] = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    parsed_json['degree_histogram'] = base64.b64encode(buf.getvalue()).decode()
 
     return parsed_json
 
@@ -224,7 +234,6 @@ async def process_task(
     other_files = {}
 
     try:
-        # Save uploaded files locally
         if files:
             for file in files:
                 file_path = os.path.join(temp_dir, file.filename)
@@ -232,7 +241,6 @@ async def process_task(
                 with open(file_path, "wb") as f:
                     f.write(content_bytes)
 
-                # Accept both question.txt and questions.txt (case-insensitive)
                 if file.filename.lower() in ["question.txt", "questions.txt"]:
                     try:
                         main_question = content_bytes.decode("utf-8")
@@ -251,26 +259,22 @@ async def process_task(
                 else:
                     other_files[file.filename] = content_bytes
 
-        # If no question(s).txt uploaded, fallback to typed question
         if not main_question:
             if question:
                 main_question = question
             else:
                 raise HTTPException(status_code=400, detail="No question provided: upload question.txt/questions.txt or use question form field")
 
-        # Split questions by line, ignore empty lines
         if isinstance(main_question, str):
             questions_list = [q.strip() for q in main_question.splitlines() if q.strip()]
         else:
             questions_list = [main_question]
 
-        # If only one question, return a single answer (not a list)
         is_single = len(questions_list) == 1
 
         results = []
         for q in questions_list:
             files_for_this_q = dict(other_files)
-            # Web scraping feature for each question
             if "scrape" in q.lower():
                 url = extract_url_from_text(q)
                 if url:
@@ -291,29 +295,23 @@ async def process_task(
 
             for fname, fbytes in files_for_this_q.items():
                 if fname.endswith(".csv"):
-                    parsed_json = auto_stats_and_charts(fbytes, parsed_json, q)
+                    df = pd.read_csv(io.BytesIO(fbytes))
+                    if is_edge_list_csv(df):
+                        parsed_json = network_stats_and_charts(fbytes, parsed_json, q)
+                    else:
+                        parsed_json = auto_stats_and_charts(fbytes, parsed_json, q)
+
             results.append(parsed_json)
 
-        # Return a single answer if only one question, else a list
         if is_single:
             return JSONResponse(content=results[0])
         else:
             return JSONResponse(content=results)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-    from fastapi import Body
 
 @app.post("/")
 async def analyze_json(payload: dict = Body(...)):
-    """
-    This endpoint is for the submission portal.
-    It expects JSON with keys 'csv' (string) and 'question'.
-    Example:
-    {
-      "csv": "region,sales,day\nWest,100,1\nEast,200,2",
-      "question": "Analyze sales data"
-    }
-    """
     csv_data = payload.get("csv")
     question = payload.get("question", "")
 
@@ -321,17 +319,14 @@ async def analyze_json(payload: dict = Body(...)):
         raise HTTPException(status_code=400, detail="Missing 'csv' in request")
 
     try:
-        # Turn CSV string into a DataFrame
         df = pd.read_csv(io.StringIO(csv_data))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid CSV format: {e}")
 
-    # Create an empty results dictionary
     parsed_json = {}
+    if is_edge_list_csv(df):
+        parsed_json = network_stats_and_charts(csv_data.encode(), parsed_json, question)
+    else:
+        parsed_json = auto_stats_and_charts(csv_data.encode(), parsed_json, question)
 
-    # Reuse your existing auto analysis function
-    parsed_json = auto_stats_and_charts(csv_data.encode(), parsed_json, question)
-
-    # Return the results
     return JSONResponse(content=parsed_json)
-    
