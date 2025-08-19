@@ -3,8 +3,10 @@ import io
 import json
 import tempfile
 import shutil
-from typing import Optional, List
-from fastapi import FastAPI, UploadFile, File, Request, HTTPException
+import base64
+import matplotlib.pyplot as plt
+from typing import Optional
+from fastapi import FastAPI, UploadFile, Request, HTTPException
 from fastapi.responses import JSONResponse
 from openai import OpenAI
 
@@ -18,12 +20,30 @@ client = OpenAI(
 MAX_FILE_CHARS = 2000
 OPENAI_TIMEOUT_SECONDS = 180
 
-async def ask_gpt(question: str, files: dict = None) -> dict:
-    system_prompt = (
-        "You are a data analyst. "
-        "Given the question and any attached data files, return the best possible answer as valid JSON. "
-        "Do not explain. Only return JSON (object or array)."
-    )
+
+def fig_to_base64(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("utf-8")
+
+
+async def ask_gpt(question: str, files: dict = None, need_chart: bool = False) -> dict:
+    if need_chart:
+        system_prompt = (
+            "You are a data analyst. "
+            "The user asked for a chart/plot. "
+            "Return JSON with: "
+            "{answer: string, x: array, y: array, xlabel: string, ylabel: string, title: string}. "
+            "Do not return code. Do not explain. Only valid JSON."
+        )
+    else:
+        system_prompt = (
+            "You are a data analyst. "
+            "Given the question and any attached data files, return the best possible answer as valid JSON. "
+            "Do not explain. Only return JSON (object or array)."
+        )
+
     prompt = question
     if files:
         summaries = []
@@ -34,6 +54,7 @@ async def ask_gpt(question: str, files: dict = None) -> dict:
                 snippet = "[binary file]"
             summaries.append(f"{name}:\n{snippet}")
         prompt += "\n\nAttached files:\n" + "\n".join(summaries)
+
     import asyncio, concurrent.futures
     loop = asyncio.get_event_loop()
     with concurrent.futures.ThreadPoolExecutor() as pool:
@@ -51,22 +72,32 @@ async def ask_gpt(question: str, files: dict = None) -> dict:
             ),
             timeout=OPENAI_TIMEOUT_SECONDS
         )
-    return json.loads(response.choices[0].message.content.strip())
 
-@app.post("/api/")
-async def process_task(
-    request: Request,
-    files: Optional[List[UploadFile]] = File(None)
-):
-    temp_dir = tempfile.mkdtemp()
-    main_question = None
-    data_files = []
+    raw_output = response.choices[0].message.content.strip()
+
+    import re
+    raw_output = re.sub(r"^```(?:json)?|```$", "", raw_output, flags=re.MULTILINE).strip()
 
     try:
-        if not files:
-            raise HTTPException(status_code=400, detail="No files provided.")
+        return json.loads(raw_output)
+    except Exception:
+        return {"error": "Invalid JSON from model", "raw_output": raw_output}
 
-        # Identify main question file and data files
+
+@app.post("/api/")
+async def process_task(request: Request):
+    form = await request.form()
+    files = []
+    main_question = None
+    data_files = []
+    temp_dir = tempfile.mkdtemp()
+
+    try:
+        # Collect all uploaded files
+        for value in form.values():
+            if isinstance(value, UploadFile):
+                files.append(value)
+
         for file in files:
             fname_lower = file.filename.lower()
             content_bytes = await file.read()
@@ -83,10 +114,27 @@ async def process_task(
 
         data_dict = {fname: content for fname, content in data_files} if data_files else None
 
-        llm_response = await ask_gpt(main_question, data_dict)
+        # 🔎 detect if chart requested
+        keywords = ["chart", "plot", "graph", "visualization"]
+        need_chart = any(k in main_question.lower() for k in keywords)
+
+        llm_response = await ask_gpt(main_question, data_dict, need_chart=need_chart)
+
+        if need_chart and "x" in llm_response and "y" in llm_response:
+            # Create chart
+            fig, ax = plt.subplots()
+            ax.plot(llm_response["x"], llm_response["y"])
+            ax.set_xlabel(llm_response.get("xlabel", ""))
+            ax.set_ylabel(llm_response.get("ylabel", ""))
+            ax.set_title(llm_response.get("title", ""))
+            chart_b64 = fig_to_base64(fig)
+            plt.close(fig)
+
+            llm_response["chart"] = chart_b64
+
         return JSONResponse(content=llm_response)
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"{e}")
+        return JSONResponse(content={"error": str(e)})
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
