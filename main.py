@@ -7,7 +7,11 @@ import asyncio
 import re
 import requests
 import pandas as pd
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request,Body
+import base64
+import matplotlib.pyplot as plt
+import io
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Body
 from fastapi.responses import JSONResponse
 from typing import List, Optional
 from openai import OpenAI
@@ -99,15 +103,37 @@ async def ask_gpt(task: str, files: Optional[dict] = None) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
-import base64
-import matplotlib.pyplot as plt
-import io
+def valid_blank_png_base64():
+    fig, ax = plt.subplots(figsize=(4,3))
+    ax.axis('off')
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    plt.close()
+    return base64.b64encode(buf.getvalue()).decode()
+
+def safe_network_response(parsed_json):
+    required_keys = [
+        "edge_count", "highest_degree_node", "average_degree",
+        "density", "shortest_path_alice_eve", "network_graph", "degree_histogram"
+    ]
+    defaults = {
+        "edge_count": 0,
+        "highest_degree_node": "",
+        "average_degree": 0.0,
+        "density": 0.0,
+        "shortest_path_alice_eve": 0,
+        "network_graph": valid_blank_png_base64(),
+        "degree_histogram": valid_blank_png_base64(),
+    }
+    for k in required_keys:
+        if k not in parsed_json or parsed_json[k] is None:
+            parsed_json[k] = defaults[k]
+    return parsed_json
 
 def auto_stats_and_charts(csv_bytes, parsed_json, question):
     import pandas as pd
     from io import BytesIO
     df = pd.read_csv(BytesIO(csv_bytes))
-
     numeric_cols = df.select_dtypes(include='number').columns.tolist()
     date_cols = [col for col in df.columns if "date" in col.lower() or "time" in col.lower()]
 
@@ -157,16 +183,11 @@ def auto_stats_and_charts(csv_bytes, parsed_json, question):
         plt.savefig(buf, format="png")
         plt.close()
         parsed_json[f"{numeric_cols[0]}_{numeric_cols[1]}_scatterplot"] = base64.b64encode(buf.getvalue()).decode()
-
     return parsed_json
 
 import networkx as nx
 
 def is_edge_list_csv(df):
-    """
-    Generalized detection of edge list CSVs.
-    Returns True if the CSV looks like a graph edge list.
-    """
     if df.shape[1] < 2:
         return False
     sample = df.iloc[:20, :2]
@@ -191,37 +212,48 @@ def network_stats_and_charts(csv_bytes, parsed_json, question):
 
     parsed_json['edge_count'] = G.number_of_edges()
     degrees = dict(G.degree())
-    highest_degree_node = max(degrees, key=degrees.get)
-    parsed_json['highest_degree_node'] = highest_degree_node
-    parsed_json['average_degree'] = round(sum(degrees.values()) / len(degrees), 2)
-    parsed_json['density'] = round(nx.density(G), 4)
+    if degrees:
+        highest_degree_node = max(degrees, key=degrees.get)
+        parsed_json['highest_degree_node'] = str(highest_degree_node)
+        parsed_json['average_degree'] = round(sum(degrees.values()) / len(degrees), 2)
+    else:
+        parsed_json['highest_degree_node'] = ""
+        parsed_json['average_degree'] = 0.0
+    parsed_json['density'] = round(nx.density(G), 4) if G.number_of_nodes() > 1 else 0.0
     try:
         parsed_json['shortest_path_alice_eve'] = nx.shortest_path_length(G, 'Alice', 'Eve')
     except Exception:
-        parsed_json['shortest_path_alice_eve'] = None
+        parsed_json['shortest_path_alice_eve'] = 0
 
-    plt.figure(figsize=(4,4))
-    pos = nx.spring_layout(G)
-    nx.draw(G, pos, with_labels=True, node_color='lightblue', edge_color='gray', font_size=10)
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    plt.close()
-    parsed_json['network_graph'] = base64.b64encode(buf.getvalue()).decode()
+    # network_graph
+    try:
+        plt.figure(figsize=(4,4))
+        pos = nx.spring_layout(G)
+        nx.draw(G, pos, with_labels=True, node_color='lightblue', edge_color='gray', font_size=10)
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png")
+        plt.close()
+        parsed_json['network_graph'] = base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        parsed_json['network_graph'] = valid_blank_png_base64()
 
-    plt.figure(figsize=(4,3))
-    degree_values = list(degrees.values())
-    plt.bar(range(len(degree_values)), degree_values, color='green')
-    plt.xlabel('Node')
-    plt.ylabel('Degree')
-    plt.title('Degree Distribution')
-    plt.xticks(range(len(degrees)), list(degrees.keys()), rotation=45)
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    plt.close()
-    parsed_json['degree_histogram'] = base64.b64encode(buf.getvalue()).decode()
-
-    return parsed_json
+    # degree_histogram
+    try:
+        plt.figure(figsize=(4,3))
+        degree_values = list(degrees.values())
+        plt.bar(range(len(degree_values)), degree_values, color='green')
+        plt.xlabel('Node')
+        plt.ylabel('Degree')
+        plt.title('Degree Distribution')
+        plt.xticks(range(len(degrees)), list(degrees.keys()), rotation=45)
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png")
+        plt.close()
+        parsed_json['degree_histogram'] = base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        parsed_json['degree_histogram'] = valid_blank_png_base64()
+    return safe_network_response(parsed_json)
 
 @app.post("/api/")
 async def process_task(
@@ -231,7 +263,7 @@ async def process_task(
 ):
     temp_dir = tempfile.mkdtemp()
     main_question = None
-    other_files = {}
+    data_files = []  # All non-question files
 
     try:
         if files:
@@ -241,9 +273,10 @@ async def process_task(
                 with open(file_path, "wb") as f:
                     f.write(content_bytes)
 
-                if file.filename.lower() in ["question.txt", "questions.txt"]:
+                fname_lower = file.filename.lower()
+                if fname_lower in ["question.txt", "questions.txt"]:
                     try:
-                        main_question = content_bytes.decode("utf-8")
+                        main_question = content_bytes.decode("utf-8").strip()
                     except Exception:
                         raise HTTPException(status_code=400, detail="Could not decode question(s).txt as UTF-8")
                 elif zipfile.is_zipfile(file_path):
@@ -253,11 +286,12 @@ async def process_task(
                             extracted_path = os.path.join(temp_dir, name)
                             try:
                                 with open(extracted_path, "rb") as extracted_file:
-                                    other_files[name] = extracted_file.read()
+                                    data_files.append( (name, extracted_file.read()) )
                             except Exception:
-                                other_files[name] = b"[unreadable file]"
+                                pass
                 else:
-                    other_files[file.filename] = content_bytes
+                    # Accept any other file as a data file
+                    data_files.append( (file.filename, content_bytes) )
 
         if not main_question:
             if question:
@@ -265,68 +299,43 @@ async def process_task(
             else:
                 raise HTTPException(status_code=400, detail="No question provided: upload question.txt/questions.txt or use question form field")
 
-        if isinstance(main_question, str):
-            questions_list = [q.strip() for q in main_question.splitlines() if q.strip()]
-        else:
-            questions_list = [main_question]
-
-        is_single = len(questions_list) == 1
-
         results = []
-        for q in questions_list:
-            files_for_this_q = dict(other_files)
-            if "scrape" in q.lower():
-                url = extract_url_from_text(q)
-                if url:
-                    try:
-                        scraped_csv = scrape_table_from_url(url)
-                        with open(scraped_csv, "rb") as f:
-                            files_for_this_q["scraped_table.csv"] = f.read()
-                    except Exception as e:
-                        results.append({"error": f"Failed to scrape table from URL: {e}"})
-                        continue
-
-            llm_response = await ask_gpt(q, files_for_this_q if files_for_this_q else None)
+        for fname, file_bytes in data_files:
+            # Try to read as CSV or Excel
             try:
-                parsed_json = json.loads(llm_response)
-            except json.JSONDecodeError:
-                results.append({"error": f"LLM response not valid JSON: {llm_response}"})
+                if fname.lower().endswith(".csv"):
+                    df = pd.read_csv(io.BytesIO(file_bytes))
+                    content_to_pass = file_bytes
+                elif fname.lower().endswith((".xlsx", ".xls")):
+                    df = pd.read_excel(io.BytesIO(file_bytes))
+                    # Convert to CSV bytes for downstream compatibility
+                    csv_buffer = io.StringIO()
+                    df.to_csv(csv_buffer, index=False)
+                    content_to_pass = csv_buffer.getvalue().encode()
+                elif fname.lower().endswith(".tsv"):
+                    df = pd.read_csv(io.BytesIO(file_bytes), sep="\t")
+                    csv_buffer = io.StringIO()
+                    df.to_csv(csv_buffer, index=False)
+                    content_to_pass = csv_buffer.getvalue().encode()
+                else:
+                    # Skip files that are not tabular data
+                    continue
+            except Exception:
+                # Skip files that can't be parsed as tabular data
                 continue
 
-            for fname, fbytes in files_for_this_q.items():
-                if fname.endswith(".csv"):
-                    df = pd.read_csv(io.BytesIO(fbytes))
-                    if is_edge_list_csv(df):
-                        parsed_json = network_stats_and_charts(fbytes, parsed_json, q)
-                    else:
-                        parsed_json = auto_stats_and_charts(fbytes, parsed_json, q)
-
+            if is_edge_list_csv(df):
+                parsed_json = network_stats_and_charts(content_to_pass, {}, main_question)
+            else:
+                parsed_json = auto_stats_and_charts(content_to_pass, {}, main_question)
             results.append(parsed_json)
 
-        if is_single:
+        if len(results) == 1:
             return JSONResponse(content=results[0])
+        elif len(results) > 1:
+            return JSONResponse(content={"results": results})
         else:
-            return JSONResponse(content=results)
+            # Fallback if no data files were parsed
+            return JSONResponse(content=safe_network_response({}))
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-
-@app.post("/")
-async def analyze_json(payload: dict = Body(...)):
-    csv_data = payload.get("csv")
-    question = payload.get("question", "")
-
-    if not csv_data:
-        raise HTTPException(status_code=400, detail="Missing 'csv' in request")
-
-    try:
-        df = pd.read_csv(io.StringIO(csv_data))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid CSV format: {e}")
-
-    parsed_json = {}
-    if is_edge_list_csv(df):
-        parsed_json = network_stats_and_charts(csv_data.encode(), parsed_json, question)
-    else:
-        parsed_json = auto_stats_and_charts(csv_data.encode(), parsed_json, question)
-
-    return JSONResponse(content=parsed_json)
