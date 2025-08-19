@@ -1,125 +1,81 @@
-import os
 import io
-import json
-import base64
-import tempfile
+import os
 import shutil
+import tempfile
+import base64
 import pandas as pd
 import matplotlib.pyplot as plt
-from typing import Optional, List
-from fastapi import FastAPI, UploadFile, File, Request, HTTPException
+
+from fastapi import FastAPI, UploadFile, Request, HTTPException
 from fastapi.responses import JSONResponse
-from openai import OpenAI
+
+from llm import ask_gpt  # <-- your LLM call via Sanand’s AI Pipe
 
 app = FastAPI()
 
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    base_url="https://aipipe.org/openai/v1"
-)
 
-MAX_FILE_CHARS = 2000
-OPENAI_TIMEOUT_SECONDS = 180
-
-# ================== Helper: Generate Base64 Charts ==================
-def fig_to_base64(fig) -> str:
+def fig_to_base64(fig):
+    """Convert Matplotlib figure to base64 PNG under 100kB."""
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight")
-    buf.seek(0)
-    img_bytes = buf.read()
     plt.close(fig)
-    # Ensure image is <100kB
-    if len(img_bytes) > 100_000:
-        raise ValueError("Generated image exceeds 100kB limit.")
-    return base64.b64encode(img_bytes).decode("utf-8")
+    data = buf.getvalue()
 
-# ================== LLM Call ==================
-async def ask_gpt(question: str, files: dict = None) -> dict:
-    system_prompt = (
-        "You are a data analyst. "
-        "Given the question and any attached data files, return the best possible answer as valid JSON. "
-        "If a chart is requested, the backend may generate it in base64. "
-        "Do not explain. Only return JSON (object or array)."
-    )
-    prompt = question
-    if files:
-        summaries = []
-        for name, content in files.items():
-            try:
-                snippet = content.decode("utf-8")[:MAX_FILE_CHARS]
-            except Exception:
-                snippet = "[binary file]"
-            summaries.append(f"{name}:\n{snippet}")
-        prompt += "\n\nAttached files:\n" + "\n".join(summaries)
+    # Resize until under 100kB
+    if len(data) > 100_000:
+        fig.set_size_inches(4, 3)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        data = buf.getvalue()
 
-    import asyncio, concurrent.futures
-    loop = asyncio.get_event_loop()
-    with concurrent.futures.ThreadPoolExecutor() as pool:
-        response = await asyncio.wait_for(
-            loop.run_in_executor(
-                pool,
-                lambda: client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0
-                )
-            ),
-            timeout=OPENAI_TIMEOUT_SECONDS
-        )
-    return json.loads(response.choices[0].message.content.strip())
+    return base64.b64encode(data).decode("utf-8")
 
-# ================== Main API ==================
+
 @app.post("/api/")
-async def process_task(
-    request: Request,
-    files: Optional[List[UploadFile]] = File(None)
-):
+async def process_task(request: Request):
     temp_dir = tempfile.mkdtemp()
     main_question = None
     data_files = []
 
     try:
-        if not files:
+        form = await request.form()
+        if not form:
             raise HTTPException(status_code=400, detail="No files provided.")
 
-        # Identify question.txt / questions.txt and data files
-        for file in files:
-            fname_lower = file.filename.lower()
-            content_bytes = await file.read()
-            if fname_lower in ("question.txt", "questions.txt") and main_question is None:
-                try:
-                    main_question = content_bytes.decode("utf-8").strip()
-                except Exception:
-                    raise HTTPException(status_code=400, detail="Question file not readable.")
-            else:
-                data_files.append((file.filename, content_bytes))
+        # Accept all fields (no matter the name)
+        for field_name, field_value in form.items():
+            if isinstance(field_value, UploadFile):
+                fname_lower = field_value.filename.lower()
+                content_bytes = await field_value.read()
+
+                if fname_lower in ("question.txt", "questions.txt") and main_question is None:
+                    try:
+                        main_question = content_bytes.decode("utf-8").strip()
+                    except Exception:
+                        raise HTTPException(status_code=400, detail="Question file not readable.")
+                else:
+                    data_files.append((field_value.filename, content_bytes))
 
         if not main_question:
             raise HTTPException(status_code=400, detail="No question.txt or questions.txt file provided.")
 
-        # Convert other files into dict for LLM context
+        # Prepare context for LLM
         data_dict = {fname: content for fname, content in data_files} if data_files else None
 
-        # Step 1: Ask LLM for structured JSON answer
+        # Call LLM
         llm_response = await ask_gpt(main_question, data_dict)
 
-        # Step 2: If charts are requested in the question → generate base64 plots
-        if "chart" in main_question.lower() or "plot" in main_question.lower() or "graph" in main_question.lower():
-            # Example: handle CSV files
+        # Auto-generate charts if asked
+        if any(word in main_question.lower() for word in ["chart", "plot", "graph"]):
             for fname, content in data_files:
                 if fname.lower().endswith(".csv"):
                     df = pd.read_csv(io.BytesIO(content))
 
-                    # Example: generate line chart of temperature if column exists
                     if "temp" in df.columns and "date" in df.columns:
                         fig, ax = plt.subplots()
                         df.plot(x="date", y="temp", ax=ax, color="red")
                         llm_response["temp_line_chart"] = fig_to_base64(fig)
 
-                    # Example: generate histogram of precipitation if column exists
                     if "precip" in df.columns:
                         fig, ax = plt.subplots()
                         df["precip"].plot(kind="hist", bins=20, ax=ax, color="orange")
